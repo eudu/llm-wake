@@ -3,8 +3,9 @@
 
 Clients (coding agents, scripts, cron jobs) talk to this proxy instead of the PC. A request goes through at once
 while the PC answers; otherwise the proxy sends a magic packet (again every few seconds: a packet that arrives while the
-PC is still shutting down is lost), holds the request until the model list answers, waits a short grace (the first
-completion right after the port opens can fail) and forwards it. Responses are streamed, so SSE completions arrive as
+PC is still shutting down is lost), holds the request until the model list answers and forwards it. Right after a
+wake the server may still fail while it loads the model, so for --retry-window seconds a 5xx or a dropped connection
+is retried (nothing has reached the client yet); a server that was up all along gets no retries. Responses are streamed, so SSE completions arrive as
 they are generated. Only a request that uses the model (POST and the like) wakes the PC: GET is how clients read the
 model lists on their own (/v1/models, /api/v1/models), so while the PC sleeps a GET gets the last copy of that path.
 GET /llm-wake/health tells whether the PC answers, without waking it. With an API key (LLM_WAKE_API_KEY) every other
@@ -53,10 +54,16 @@ def send_magic_packet(mac, broadcast, port=9):
 class Waker:
     """Checks the upstream and wakes it once for all the requests that wait at the same time."""
 
-    def __init__(self, host, port, ready_path, wake, wake_timeout, grace, poll, resend):
+    def __init__(self, host, port, ready_path, wake, wake_timeout, grace, poll, resend, retry_window):
         self.host, self.port, self.ready_path = host, port, ready_path
         self.wake, self.wake_timeout, self.grace, self.poll, self.resend = wake, wake_timeout, grace, poll, resend
+        self.retry_window = retry_window
+        # until this moment (time.monotonic) failures of the upstream are taken for a model still loading after a wake
+        self.retry_until = 0.0
         self.lock = threading.Lock()
+
+    def just_woken(self):
+        return time.monotonic() < self.retry_until
 
     def answers(self, timeout=2.0):
         conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
@@ -87,8 +94,9 @@ class Waker:
                     self.wake()
                     sent = time.monotonic()
                 if self.answers():
-                    log.info('upstream answers, forwarding after %.0f s of grace', self.grace)
+                    log.info('upstream answers after %.0f s', time.monotonic() - deadline + self.wake_timeout)
                     time.sleep(self.grace)
+                    self.retry_until = time.monotonic() + self.retry_window
                     return True
             log.warning('upstream did not answer within %.0f s', self.wake_timeout)
             return False
@@ -178,12 +186,27 @@ class Handler(BaseHTTPRequestHandler):
         skip = HOP_BY_HOP | ({'authorization'} if self.server.api_key else set())
         headers = {k: v for k, v in self.headers.items() if k.lower() not in skip}
         headers['Host'] = f'{waker.host}:{waker.port}'
-        conn = http.client.HTTPConnection(waker.host, waker.port, timeout=self.server.read_timeout)
-        try:
-            conn.request(self.command, self.path, body=body, headers=headers)
-            response = conn.getresponse()
-        except OSError as error:
-            conn.close()
+        attempt = 0
+        while True:
+            attempt += 1
+            conn = http.client.HTTPConnection(waker.host, waker.port, timeout=self.server.read_timeout)
+            try:
+                conn.request(self.command, self.path, body=body, headers=headers)
+                response = conn.getresponse()
+                error = None
+            except OSError as caught:
+                conn.close()
+                response, error = None, caught
+            failed = error is not None or response.status >= 500
+            if not failed or not waker.just_woken():
+                break
+            # the model is still loading after a wake: the client has got nothing yet, ask again
+            log.info('upstream %s after a wake, retrying (attempt %d)', error or response.status, attempt)
+            if response is not None:
+                response.read()
+                conn.close()
+            time.sleep(waker.poll)
+        if error is not None:
             self.reply_json(502, {'error': {'message': f'LM Studio at {self.server.upstream}: {error}',
                                             'type': 'llm_wake_upstream'}})
             return
@@ -211,13 +234,14 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
 
 
-def make_server(listen, upstream, wake, ready_path='/v1/models', wake_timeout=240.0, grace=15.0, poll=5.0, resend=15.0,
-                cache_dir=None, read_timeout=900.0, api_key=None):
+def make_server(listen, upstream, wake, ready_path='/v1/models', wake_timeout=240.0, grace=0.0, poll=2.0, resend=15.0,
+                cache_dir=None, read_timeout=900.0, api_key=None, retry_window=60.0):
     parsed = urllib.parse.urlsplit(upstream)
     server = ThreadingHTTPServer(listen, Handler)
     server.daemon_threads = True
     server.upstream = upstream
-    server.waker = Waker(parsed.hostname, parsed.port or 80, ready_path, wake, wake_timeout, grace, poll, resend)
+    server.waker = Waker(parsed.hostname, parsed.port or 80, ready_path, wake, wake_timeout, grace, poll, resend,
+                         retry_window)
     server.cache_dir = Path(cache_dir) if cache_dir else None
     server.read_timeout = read_timeout
     server.api_key = api_key or None
@@ -232,7 +256,9 @@ def main(argv=None):
     parser.add_argument('--broadcast', default='255.255.255.255', help='where the magic packet goes')
     # opencode gives up on response headers after 300 s: answer 504 before that
     parser.add_argument('--wake-timeout', type=float, default=240.0, help='seconds to hold a request while the PC boots')
-    parser.add_argument('--grace', type=float, default=15.0, help='seconds to wait after the PC first answers')
+    parser.add_argument('--grace', type=float, default=0.0, help='seconds to wait after the PC first answers')
+    parser.add_argument('--retry-window', type=float, default=60.0,
+                        help='seconds after a wake in which a 5xx or a dropped connection is retried')
     parser.add_argument('--resend', type=float, default=15.0, help='seconds between magic packets while waiting')
     parser.add_argument('--cache-dir', default=None, help='copies of GET answers served while the PC sleeps')
     args = parser.parse_args(argv)
@@ -248,6 +274,7 @@ def main(argv=None):
         wake_timeout=args.wake_timeout,
         grace=args.grace,
         resend=args.resend,
+        retry_window=args.retry_window,
         cache_dir=args.cache_dir,
         api_key=api_key,
     )

@@ -28,6 +28,9 @@ class FakeLmStudio(BaseHTTPRequestHandler):
 
     # headers of the last request, to see what the proxy passes on
     last_headers = None
+    # the next POSTs answered with 500, like LM Studio while the model loads after a boot
+    fail_next = 0
+    posts = 0
 
     def log_message(self, *args):
         pass
@@ -45,7 +48,12 @@ class FakeLmStudio(BaseHTTPRequestHandler):
 
     def do_POST(self):
         FakeLmStudio.last_headers = dict(self.headers)
+        FakeLmStudio.posts += 1
         body = self.rfile.read(int(self.headers['Content-Length']))
+        if FakeLmStudio.fail_next > 0:
+            FakeLmStudio.fail_next -= 1
+            self.send_error(500, 'model is loading')
+            return
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Transfer-Encoding', 'chunked')
@@ -81,6 +89,8 @@ class Upstream:
 
 class ProxyTest(unittest.TestCase):
     def setUp(self):
+        FakeLmStudio.fail_next = 0
+        FakeLmStudio.posts = 0
         self.upstream = Upstream(free_port())
         self.wakes = []
         self.cache = Path(tempfile.mkdtemp())
@@ -229,6 +239,27 @@ class ProxyTest(unittest.TestCase):
         base = self.start_proxy(api_key='secret')
         status, body = self.get(base, '/llm-wake/health')
         self.assertEqual((status, json.loads(body)['upstream']), (200, False))
+
+
+    def test_after_a_wake_a_5xx_is_retried_until_the_model_answers(self):
+        # no fixed pause: the request goes at once and is repeated while the server still fails
+        FakeLmStudio.fail_next = 2
+        base = self.start_proxy(grace=0.0)
+        status, _, body = self.post(base, {'model': 'qwen/qwen3.8-27b'})
+        self.assertEqual(status, 200)
+        self.assertIn(b'qwen/qwen3.8-27b', body)
+        self.assertEqual(FakeLmStudio.posts, 3)
+        self.assertEqual(len(self.wakes), 1)
+
+    def test_without_a_wake_a_5xx_reaches_the_client(self):
+        # a server that was up all along has a real error: it must not be hidden
+        self.upstream.start()
+        FakeLmStudio.fail_next = 1
+        base = self.start_proxy()
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.post(base, {'model': 'qwen/qwen3.8-27b'})
+        self.assertEqual(caught.exception.code, 500)
+        self.assertEqual(FakeLmStudio.posts, 1)
 
 
 if __name__ == '__main__':

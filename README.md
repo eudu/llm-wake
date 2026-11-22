@@ -20,16 +20,18 @@ Wake-on-LAN alone is not enough for an LLM server:
 - Agents and editors poll the model list (`GET /v1/models`) on their own every few seconds. If that wakes the PC, it
   never stays off.
 - A magic packet sent while Windows is still shutting down is lost; one packet is not always enough.
-- The server's port opens before the model is ready: the first completion right after the boot can fail.
+- The server's port opens before the model is ready: the first completion right after a boot can fail with `500`.
 - Completions are streamed (SSE) and must not be buffered.
 
 ## How it works
 
 - **Requests that use the model** (`POST` and every other method except `GET` and `HEAD`): if the upstream answers
   `GET /v1/models`, the request goes through at once. Otherwise llm-wake sends a magic packet, repeats it every
-  `--resend` seconds, waits up to `--wake-timeout` seconds for `/v1/models` to answer, waits `--grace` seconds more
-  and forwards the request. Requests that arrive at the same time share one wake. If the PC does not answer in time,
-  the client gets `504` with an OpenAI-style error body.
+  `--resend` seconds, waits up to `--wake-timeout` seconds for `/v1/models` to answer and forwards the request at
+  once. For `--retry-window` seconds after a wake a `5xx` or a dropped connection from the server is retried every
+  few seconds: nothing has reached the client yet, and the server is most likely still loading the model. A server
+  that was up all along gets no retries, so its real errors reach the client. Requests that arrive at the same time
+  share one wake. If the PC does not answer in time, the client gets `504` with an OpenAI-style error body.
 - **`GET` and `HEAD` never wake the PC.** While the PC answers, llm-wake keeps a copy of the last answer of each path
   in `--cache-dir`; while it sleeps, a `GET` gets that copy (or `503` if there is none). Model pickers keep working
   and the PC stays off.
@@ -76,7 +78,8 @@ curl -H "Authorization: Bearer $(cat /etc/llm-wake/api-key)" http://<proxy>:1234
 | `--mac` | (required) | MAC address of the PC's network card |
 | `--broadcast` | `255.255.255.255` | where the magic packet goes; use the subnet broadcast (e.g. `192.168.1.255`) on macOS and when the proxy has several interfaces |
 | `--wake-timeout` | `240` | seconds to hold a request while the PC boots; keep it below your client's own timeout |
-| `--grace` | `15` | seconds to wait after the PC first answers |
+| `--grace` | `0` | extra seconds to wait after the PC first answers, before the first try |
+| `--retry-window` | `60` | seconds after a wake in which a `5xx` or a dropped connection is retried |
 | `--resend` | `15` | seconds between magic packets while waiting |
 | `--cache-dir` | none | where copies of `GET` answers are kept; without it a `GET` to a sleeping PC gets `503` |
 
@@ -124,7 +127,7 @@ Other ways to wake a machine on demand, as of November 2026:
 | What it is | one Python file | Rust service with web dashboard, TUI, tray, network scanner, remote shutdown | Caddy plugin | Go tool in the llama-swap repo |
 | Works with | any HTTP server with `/v1/models` | any TCP service | any HTTP service behind Caddy | llama-swap only (needs its `/api/events` and `/wol-health`) |
 | Proxies | HTTP, streamed | TCP | HTTP (Caddy `reverse_proxy`) | HTTP |
-| Ready when | `/v1/models` answers, plus a grace period | the TCP port accepts a connection | the upstream accepts a connection (Caddy retry) | llama-swap's event stream is connected |
+| Ready when | `/v1/models` answers; `5xx` right after the wake is retried | the TCP port accepts a connection | the upstream accepts a connection (Caddy retry) | llama-swap's event stream is connected |
 | Wait while booting | `--wake-timeout`, 240 s by default | 60 s, fixed in code | `lb_try_duration` in the Caddyfile | `-timeout`, 60 s by default |
 | Repeats the magic packet | every 15 s while waiting | one burst before the wait (count configurable) | at most once per 10 minutes per host | not described in its README |
 | Requests that do not wake | all `GET`/`HEAD`, answered from a cache | none | none (any request that fails with an error) | `/api/events` only |
