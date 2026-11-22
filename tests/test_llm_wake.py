@@ -26,6 +26,9 @@ MODELS = {'object': 'list', 'data': [{'id': 'qwen/qwen3.8-27b', 'object': 'model
 class FakeLmStudio(BaseHTTPRequestHandler):
     """/v1/models, and an echo of the request streamed back in two chunks like an SSE completion."""
 
+    # headers of the last request, to see what the proxy passes on
+    last_headers = None
+
     def log_message(self, *args):
         pass
 
@@ -41,6 +44,7 @@ class FakeLmStudio(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        FakeLmStudio.last_headers = dict(self.headers)
         body = self.rfile.read(int(self.headers['Content-Length']))
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
@@ -82,7 +86,7 @@ class ProxyTest(unittest.TestCase):
         self.cache = Path(tempfile.mkdtemp())
         self.addCleanup(self.upstream.stop)
 
-    def start_proxy(self, wake=None, wake_timeout=5.0, grace=0.0, resend=10.0):
+    def start_proxy(self, wake=None, wake_timeout=5.0, grace=0.0, resend=10.0, api_key=None):
         def default_wake():
             self.wakes.append(time.monotonic())
             # the PC boots for a while before the server answers
@@ -97,24 +101,25 @@ class ProxyTest(unittest.TestCase):
             poll=0.1,
             resend=resend,
             cache_dir=self.cache,
+            api_key=api_key,
         )
         threading.Thread(target=proxy.serve_forever, daemon=True).start()
         self.addCleanup(proxy.server_close)
         self.addCleanup(proxy.shutdown)
         return f'http://127.0.0.1:{proxy.server_address[1]}'
 
-    def post(self, base, payload):
+    def post(self, base, payload, headers=None):
         request = urllib.request.Request(
             base + '/v1/chat/completions',
             data=json.dumps(payload).encode(),
-            headers={'Content-Type': 'application/json'},
+            headers={'Content-Type': 'application/json', **(headers or {})},
         )
         with urllib.request.urlopen(request, timeout=20) as response:
             return response.status, response.headers.get('Content-Type'), response.read()
 
-    def get(self, base, path):
+    def get(self, base, path, headers=None):
         try:
-            with urllib.request.urlopen(base + path, timeout=20) as response:
+            with urllib.request.urlopen(urllib.request.Request(base + path, headers=headers or {}), timeout=20) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as error:
             return error.code, error.read()
@@ -198,6 +203,32 @@ class ProxyTest(unittest.TestCase):
         status, body = self.get(base, '/llm-wake/health')
         self.assertEqual((status, json.loads(body)['upstream']), (200, True))
         self.assertEqual(self.wakes, [])
+
+
+    def test_with_a_key_a_request_without_it_gets_401_and_does_not_wake(self):
+        base = self.start_proxy(api_key='secret')
+        for headers in [None, {'Authorization': 'Bearer wrong'}, {'Authorization': 'secret'}]:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                self.post(base, {'model': 'qwen/qwen3.8-27b'}, headers=headers)
+            self.assertEqual(caught.exception.code, 401)
+            self.assertEqual(json.loads(caught.exception.read())['error']['type'], 'llm_wake_unauthorized')
+        status, _ = self.get(base, '/v1/models')
+        self.assertEqual(status, 401)
+        self.assertEqual(self.wakes, [])
+
+    def test_with_the_key_the_request_goes_through_without_it(self):
+        base = self.start_proxy(api_key='secret')
+        status, _, body = self.post(base, {'model': 'qwen/qwen3.8-27b'}, headers={'Authorization': 'Bearer secret'})
+        self.assertEqual(status, 200)
+        self.assertIn(b'qwen/qwen3.8-27b', body)
+        self.assertEqual(len(self.wakes), 1)
+        # the key is the proxy's own; the server on the PC does not get it
+        self.assertNotIn('Authorization', FakeLmStudio.last_headers)
+
+    def test_health_needs_no_key(self):
+        base = self.start_proxy(api_key='secret')
+        status, body = self.get(base, '/llm-wake/health')
+        self.assertEqual((status, json.loads(body)['upstream']), (200, False))
 
 
 if __name__ == '__main__':

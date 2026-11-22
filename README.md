@@ -34,6 +34,9 @@ Wake-on-LAN alone is not enough for an LLM server:
   in `--cache-dir`; while it sleeps, a `GET` gets that copy (or `503` if there is none). Model pickers keep working
   and the PC stays off.
 - **`GET /llm-wake/health`** answers `{"upstream": true|false, "url": ...}` without waking the PC.
+- **API key (optional, recommended).** When `LLM_WAKE_API_KEY` is set, every request except the health check needs
+  `Authorization: Bearer <key>`. Without it the answer is `401` and the PC is not woken. The key belongs to the proxy
+  and is not passed on to the LLM server.
 - Everything else is proxied as is: method, path, body and headers go to the upstream unchanged, the response is
   streamed back chunk by chunk. llm-wake does not parse the OpenAI API, so any HTTP server works; the PC counts as up
   when `GET /v1/models` returns `200` (LM Studio, Ollama and llama.cpp `llama-server` all serve it).
@@ -58,7 +61,13 @@ python3 llm_wake.py \
   --cache-dir /var/lib/llm-wake
 ```
 
-Then use `http://<proxy>:1234/v1` as the base URL of an OpenAI-compatible provider in your client.
+Then use `http://<proxy>:1234/v1` as the base URL of an OpenAI-compatible provider in your client, with the key as its
+API key. To require a key, start the proxy with it in the environment (not as a flag, flags show in the process list):
+
+```sh
+LLM_WAKE_API_KEY="$(cat /etc/llm-wake/api-key)" python3 llm_wake.py ...
+curl -H "Authorization: Bearer $(cat /etc/llm-wake/api-key)" http://<proxy>:1234/v1/chat/completions ...
+```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -82,6 +91,8 @@ Wants=network-online.target
 [Service]
 DynamicUser=yes
 StateDirectory=llm-wake
+# one line LLM_WAKE_API_KEY=<key>, mode 0600, owned by root
+EnvironmentFile=/etc/llm-wake/env
 ExecStart=/usr/bin/python3 -I /opt/llm-wake/llm_wake.py --listen 0.0.0.0:1234 --upstream http://192.168.1.50:1234 --mac 00:11:22:33:44:55 --broadcast 192.168.1.255 --cache-dir /var/lib/llm-wake
 Restart=on-failure
 NoNewPrivileges=yes
@@ -98,9 +109,11 @@ The proxy uses about 15 MB of memory.
 
 ## Security
 
-llm-wake has no authentication. It is meant for a home LAN: anyone who can reach its port can use the model and wake
-the PC. Do not expose it to the internet; put it behind a VPN or a reverse proxy with authentication if you need
-remote access.
+Without `LLM_WAKE_API_KEY` anyone who can reach the port can use the model and wake the PC, and a web page opened in a
+browser on the same LAN can send it requests blindly (llm-wake adds no CORS headers, so the page cannot read the
+answers). Set a key. llm-wake speaks plain HTTP and has no rate limits: keep it inside the LAN or a VPN and do not
+expose it to the internet. It can only reach the one `--upstream` given at start; nothing about it can be changed over
+the network.
 
 ## Comparison
 
@@ -115,6 +128,7 @@ Other ways to wake a machine on demand, as of November 2026:
 | Wait while booting | `--wake-timeout`, 240 s by default | 60 s, fixed in code | `lb_try_duration` in the Caddyfile | `-timeout`, 60 s by default |
 | Repeats the magic packet | every 15 s while waiting | one burst before the wait (count configurable) | at most once per 10 minutes per host | not described in its README |
 | Requests that do not wake | all `GET`/`HEAD`, answered from a cache | none | none (any request that fails with an error) | `/api/events` only |
+| Authentication | optional API key | none on the dashboard API (v0.2.14); shutdown requests to the client are authenticated | whatever Caddy is configured with | llama-swap's own `apiKeys` |
 | Extra features | none | dashboard, auto shutdown after inactivity, network discovery | everything Caddy does (TLS, auth) | model swapping in llama-swap |
 | Setup | `python3 llm_wake.py ...` | installer, Docker or Homebrew | build Caddy with `xcaddy` | `go build` |
 
