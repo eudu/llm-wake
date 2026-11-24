@@ -20,6 +20,8 @@ SPEC = importlib.util.spec_from_file_location('llm_wake', ROOT / 'llm_wake.py')
 llm_wake = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(llm_wake)
 
+# what LM Studio 0.4.24 streams when the model is unloaded under a running completion (seen 2026-11-24)
+UNLOADED = (b'event: error\ndata: {"error":{"message":"Model is unloaded."},"message":"Model is unloaded."}\n\n')
 MODELS = {'object': 'list', 'data': [{'id': 'qwen/qwen3.8-27b', 'object': 'model'}]}
 
 
@@ -30,6 +32,10 @@ class FakeLmStudio(BaseHTTPRequestHandler):
     last_headers = None
     # the next POSTs answered with 500, like LM Studio while the model loads after a boot
     fail_next = 0
+    # the next POSTs get 200 and an SSE error event: LM Studio unloaded the model by TTL as the PC woke up
+    unload_next = 0
+    # seconds of silence after the headers, like LM Studio while it processes a long prompt
+    first_event_delay = 0.0
     posts = 0
 
     def log_message(self, *args):
@@ -58,7 +64,13 @@ class FakeLmStudio(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Transfer-Encoding', 'chunked')
         self.end_headers()
-        for part in [b'data: ' + body + b'\n\n', b'data: [DONE]\n\n']:
+        self.wfile.flush()
+        parts = [b'data: ' + body + b'\n\n', b'data: [DONE]\n\n']
+        if FakeLmStudio.unload_next > 0:
+            FakeLmStudio.unload_next -= 1
+            parts = [UNLOADED]
+        time.sleep(FakeLmStudio.first_event_delay)
+        for part in parts:
             self.wfile.write(b'%x\r\n%s\r\n' % (len(part), part))
             self.wfile.flush()
             time.sleep(0.05)
@@ -90,13 +102,15 @@ class Upstream:
 class ProxyTest(unittest.TestCase):
     def setUp(self):
         FakeLmStudio.fail_next = 0
+        FakeLmStudio.unload_next = 0
+        FakeLmStudio.first_event_delay = 0.0
         FakeLmStudio.posts = 0
         self.upstream = Upstream(free_port())
         self.wakes = []
         self.cache = Path(tempfile.mkdtemp())
         self.addCleanup(self.upstream.stop)
 
-    def start_proxy(self, wake=None, wake_timeout=5.0, grace=0.0, resend=10.0, api_key=None):
+    def start_proxy(self, wake=None, wake_timeout=5.0, grace=0.0, resend=10.0, api_key=None, retry_window=60.0):
         def default_wake():
             self.wakes.append(time.monotonic())
             # the PC boots for a while before the server answers
@@ -112,6 +126,7 @@ class ProxyTest(unittest.TestCase):
             resend=resend,
             cache_dir=self.cache,
             api_key=api_key,
+            retry_window=retry_window,
         )
         threading.Thread(target=proxy.serve_forever, daemon=True).start()
         self.addCleanup(proxy.server_close)
@@ -259,6 +274,39 @@ class ProxyTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as caught:
             self.post(base, {'model': 'qwen/qwen3.8-27b'})
         self.assertEqual(caught.exception.code, 500)
+        self.assertEqual(FakeLmStudio.posts, 1)
+
+    def test_after_a_wake_an_unloaded_model_error_is_retried(self):
+        # LM Studio unloads the model by TTL right after the PC wakes and answers 200 with an SSE error event
+        FakeLmStudio.unload_next = 1
+        base = self.start_proxy()
+        status, _, body = self.post(base, {'model': 'qwen/qwen3.8-27b', 'stream': True})
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'data: {"model": "qwen/qwen3.8-27b", "stream": true}\n\ndata: [DONE]\n\n')
+        self.assertEqual(FakeLmStudio.posts, 2)
+        self.assertEqual(len(self.wakes), 1)
+
+    def test_without_a_wake_an_unloaded_model_error_reaches_the_client(self):
+        self.upstream.start()
+        FakeLmStudio.unload_next = 1
+        base = self.start_proxy()
+        status, _, body = self.post(base, {'model': 'qwen/qwen3.8-27b', 'stream': True})
+        self.assertEqual((status, body), (200, UNLOADED))
+        self.assertEqual(FakeLmStudio.posts, 1)
+
+    def test_a_silent_stream_after_a_wake_is_not_held_past_the_retry_window(self):
+        # LM Studio sends nothing while it processes a long prompt; the client must get the headers by the window's end
+        FakeLmStudio.first_event_delay = 2.0
+        base = self.start_proxy(retry_window=0.5)
+        request = urllib.request.Request(base + '/v1/chat/completions', data=b'{"stream": true}',
+                                         headers={'Content-Type': 'application/json'})
+        started = time.monotonic()
+        with urllib.request.urlopen(request, timeout=20) as response:
+            headers_after = time.monotonic() - started
+            body = response.read()
+        # boot 0.5 s plus the 0.5 s window, well before the first event at 2 s
+        self.assertLess(headers_after, 1.6)
+        self.assertEqual(body, b'data: {"stream": true}\n\ndata: [DONE]\n\n')
         self.assertEqual(FakeLmStudio.posts, 1)
 
 

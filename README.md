@@ -28,8 +28,11 @@ Wake-on-LAN alone is not enough for an LLM server:
 - **Requests that use the model** (`POST` and every other method except `GET` and `HEAD`): if the upstream answers
   `GET /v1/models`, the request goes through at once. Otherwise llm-wake sends a magic packet, repeats it every
   `--resend` seconds, waits up to `--wake-timeout` seconds for `/v1/models` to answer and forwards the request at
-  once. For `--retry-window` seconds after a wake a `5xx` or a dropped connection from the server is retried every
-  few seconds: nothing has reached the client yet, and the server is most likely still loading the model. A server
+  once. For `--retry-window` seconds after a wake a `5xx`, a dropped connection or a stream that opens with an error
+  about an unloaded model is retried every few seconds: nothing has reached the client yet, and the server is most
+  likely still loading the model. LM Studio unloads a model whose idle TTL ran out during the sleep a few seconds
+  after the PC wakes, right under the request that woke it, and answers `200` with `event: error`. The wait for the
+  first event ends with the window, since the server sends nothing while it reads a long prompt. A server
   that was up all along gets no retries, so its real errors reach the client. Requests that arrive at the same time
   share one wake. If the PC does not answer in time, the client gets `504` with an OpenAI-style error body.
 - **`GET` and `HEAD` never wake the PC.** While the PC answers, llm-wake keeps a copy of the last answer of each path
@@ -79,7 +82,7 @@ curl -H "Authorization: Bearer $(cat /etc/llm-wake/api-key)" http://<proxy>:1234
 | `--broadcast` | `255.255.255.255` | where the magic packet goes; use the subnet broadcast (e.g. `192.168.1.255`) on macOS and when the proxy has several interfaces |
 | `--wake-timeout` | `240` | seconds to hold a request while the PC boots; keep it below your client's own timeout |
 | `--grace` | `0` | extra seconds to wait after the PC first answers, before the first try |
-| `--retry-window` | `60` | seconds after a wake in which a `5xx` or a dropped connection is retried |
+| `--retry-window` | `60` | seconds after a wake in which a `5xx`, a dropped connection or an unloaded model is retried |
 | `--resend` | `15` | seconds between magic packets while waiting |
 | `--cache-dir` | none | where copies of `GET` answers are kept; without it a `GET` to a sleeping PC gets `503` |
 

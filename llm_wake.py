@@ -4,8 +4,10 @@
 Clients (coding agents, scripts, cron jobs) talk to this proxy instead of the PC. A request goes through at once
 while the PC answers; otherwise the proxy sends a magic packet (again every few seconds: a packet that arrives while the
 PC is still shutting down is lost), holds the request until the model list answers and forwards it. Right after a
-wake the server may still fail while it loads the model, so for --retry-window seconds a 5xx or a dropped connection
-is retried (nothing has reached the client yet); a server that was up all along gets no retries. Responses are streamed, so SSE completions arrive as
+wake the server may still fail while it loads the model, so for --retry-window seconds a 5xx, a dropped connection or
+a stream that opens with an error about an unloaded model (LM Studio unloads a model whose idle TTL ran out during
+the sleep right as the PC wakes) is retried: nothing has reached the client yet. A server that was up all along gets
+no retries. Responses are streamed, so SSE completions arrive as
 they are generated. Only a request that uses the model (POST and the like) wakes the PC: GET is how clients read the
 model lists on their own (/v1/models, /api/v1/models), so while the PC sleeps a GET gets the last copy of that path.
 GET /llm-wake/health tells whether the PC answers, without waking it. With an API key (LLM_WAKE_API_KEY) every other
@@ -100,6 +102,33 @@ class Waker:
                     return True
             log.warning('upstream did not answer within %.0f s', self.wake_timeout)
             return False
+
+
+class FirstChunk:
+    """The first piece of a streamed body, read aside: LM Studio sends nothing while it reads a long prompt, so the
+    wait for it ends with the retry window, and the rest of the stream goes to the client as usual."""
+
+    def __init__(self, response, wait):
+        self.data, self.error = None, None
+        self.reader = threading.Thread(target=self.read, args=(response,), daemon=True)
+        self.reader.start()
+        self.reader.join(max(wait, 0.0))
+
+    def read(self, response):
+        try:
+            self.data = response.read1(65536)
+        except OSError as caught:
+            self.error = caught
+
+    def unloaded(self):
+        # LM Studio: event: error, data: {"error":{"message":"Model is unloaded."}, ...}
+        return bool(self.data) and self.data.startswith(b'event: error') and b'unload' in self.data.lower()
+
+    def get(self):
+        self.reader.join()
+        if self.error is not None:
+            raise self.error
+        return self.data
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -198,12 +227,18 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
                 response, error = None, caught
             failed = error is not None or response.status >= 500
+            first = None
+            if not failed and waker.just_woken() and 'event-stream' in (response.getheader('Content-Type') or ''):
+                first = FirstChunk(response, waker.retry_until - time.monotonic())
+                failed = first.unloaded()
             if not failed or not waker.just_woken():
                 break
             # the model is still loading after a wake: the client has got nothing yet, ask again
-            log.info('upstream %s after a wake, retrying (attempt %d)', error or response.status, attempt)
+            reason = 'unloaded the model' if first else error or response.status
+            log.info('upstream %s after a wake, retrying (attempt %d)', reason, attempt)
             if response is not None:
-                response.read()
+                if not first:
+                    response.read()
                 conn.close()
             time.sleep(waker.poll)
         if error is not None:
@@ -221,6 +256,9 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             if self.command == 'HEAD':
                 return
+            if first is not None and (chunk := first.get()):
+                self.wfile.write(chunk)
+                self.wfile.flush()
             if keep is not None and response.status == 200:
                 data = response.read()
                 keep.parent.mkdir(parents=True, exist_ok=True)
@@ -258,7 +296,7 @@ def main(argv=None):
     parser.add_argument('--wake-timeout', type=float, default=240.0, help='seconds to hold a request while the PC boots')
     parser.add_argument('--grace', type=float, default=0.0, help='seconds to wait after the PC first answers')
     parser.add_argument('--retry-window', type=float, default=60.0,
-                        help='seconds after a wake in which a 5xx or a dropped connection is retried')
+                        help='seconds after a wake in which a 5xx, a dropped connection or an unloaded model is retried')
     parser.add_argument('--resend', type=float, default=15.0, help='seconds between magic packets while waiting')
     parser.add_argument('--cache-dir', default=None, help='copies of GET answers served while the PC sleeps')
     args = parser.parse_args(argv)
